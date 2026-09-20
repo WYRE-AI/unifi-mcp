@@ -1,11 +1,21 @@
 /**
  * UniFi's Cloud Site Manager API authenticates with a single static
  * `X-API-Key` header tied to a UI.com account - there is no OAuth dance and
- * no per-request token exchange. Ubiquiti's own docs state the key is
- * currently read-only account-wide (confirmed against the published
- * OpenAPI spec: every operation is GET except one POST that queries ISP
- * metrics, no mutating endpoint exists anywhere on this surface). This
- * connector never performs any write; see README's Scope section.
+ * no per-request token exchange.
+ *
+ * Structurally verified (checked directly): this connector's own code makes
+ * zero mutating calls - every function in client.ts calls one of the 9
+ * dedicated read operations, and the connector-proxy path is never
+ * referenced under any name.
+ *
+ * Vendor-documented, not independently verified (hedged deliberately):
+ * Ubiquiti's own docs describe the key as read-only ("cannot be used to
+ * make modifications to your UniFi infrastructure"). The live spec defines
+ * a 10th path, `/v1/connector/consoles/{id}/*path`, a generic reverse-proxy
+ * supporting all 5 HTTP methods that this connector deliberately excludes
+ * (see README's Scope section). Whether UI.com's backend actually blocks
+ * writes sent through that path, versus it being documented policy rather
+ * than a hard technical block, has not been tested by WYRE.
  */
 export interface UniFiCredentials {
   apiKey: string;
