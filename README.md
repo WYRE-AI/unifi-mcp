@@ -22,7 +22,7 @@ Two separate claims here, at deliberately different confidence levels - don't co
 - **Structurally verified (checked directly, stated with full confidence):** this connector's own code makes zero mutating calls. Every function in `client.ts` calls one of the 9 dedicated read operations below; no `POST`/`PUT`/`PATCH`/`DELETE` call exists anywhere in `src/`, and the connector-proxy path (below) is never referenced under any name.
 - **Vendor-documented, not independently verified (hedged deliberately):** Ubiquiti's own Getting Started documentation describes Site Manager API keys generally as read-only ("currently read-only... cannot be used to make modifications to your UniFi infrastructure"). Whether that's actually enforced *server-side* against the connector-proxy path specifically - i.e. whether UI.com's backend rejects a write verb sent through `/v1/connector/consoles/{id}/*path`, versus the restriction being a documented policy rather than a hard technical block - has not been tested by WYRE. Nobody on this review sent a write verb against a live key to find out, correctly: that would be a destructive test against real customer infrastructure, not something to run without consent. **Do not read this connector, or this README, as having established that the underlying API key cannot perform writes** - only that this connector's own code never attempts one.
 
-In gateway mode the key arrives per-request via the `X-UniFi-Api-Key` header; in local/stdio mode it's read once from `UNIFI_API_KEY`.
+In gateway mode the key arrives per-request via the `X-UniFi-Api-Key` header; in local/stdio mode it's read once from `UNIFI_API_KEY`. HTTP mode also requires a signed `X-Gateway-S2S` header — see Configuration.
 
 ### The connector-proxy endpoint (excluded by design)
 
@@ -32,13 +32,37 @@ This connector deliberately excludes the connector-proxy endpoint entirely, for 
 
 ## Configuration
 
-| Env var | Description |
-|---|---|
-| `UNIFI_API_KEY` | UniFi Cloud Site Manager API key. |
-| `MCP_TRANSPORT` | `stdio` (default) or `http`. |
-| `AUTH_MODE` | `env` (default, reads the var above) or `gateway` (credential arrives per-request via the `X-UniFi-Api-Key` header, injected by the Conduit gateway). |
-| `CONDUIT_S2S_SECRET` | When set, the HTTP transport requires a valid `X-Gateway-S2S` header (Conduit sidecar auth) on every `/mcp` request. |
-| `LOG_LEVEL` | `debug` \| `info` (default) \| `warn` \| `error`. |
+Copy [`.env.example`](.env.example) and set the variables below.
+
+| Env var | Required | Description |
+|---|---|---|
+| `UNIFI_API_KEY` | For stdio and `AUTH_MODE=env` | UniFi Cloud Site Manager API key (`X-API-Key`). |
+| `MCP_TRANSPORT` | No | `stdio` (default) or `http`. |
+| `AUTH_MODE` | No | `gateway` (Docker image and Compose) or `env`. Gateway mode requires `X-UniFi-Api-Key` on each `/mcp` request and never falls back to `UNIFI_API_KEY`. `env` uses that variable only after S2S auth succeeds. Unset means `env` (stdio and single-tenant HTTP). |
+| `CONDUIT_S2S_SECRET` | Yes for HTTP | Service-to-service secret. The HTTP server logs an error and exits non-zero when this is empty or a known placeholder (`changeme`, `secret`, `replace-me`, `your-s2s-secret`, and the other example values). Generate one with `openssl rand -hex 32`. Compose will not start without it. The value is never logged. |
+| `MCP_ALLOW_INSECURE_DEV` | No | Set to exactly `1` only for local development to start HTTP without `CONDUIT_S2S_SECRET`. The process logs a warning, does not enforce `X-Gateway-S2S`, and binds `127.0.0.1` only. A non-loopback `MCP_HTTP_HOST` is overridden and logged. A known placeholder secret still refuses to start. |
+| `MCP_HTTP_HOST` | No | Bind address when a real `CONDUIT_S2S_SECRET` is set. Unset keeps `0.0.0.0`, the historical bind. The image and Compose set `0.0.0.0` inside the container. With no secret, the listener is `127.0.0.1` regardless of this value. |
+| `MCP_HTTP_PORT` | No | HTTP port. Defaults to `8080`. |
+| `LOG_LEVEL` | No | `debug` \| `info` (default) \| `warn` \| `error`. |
+
+`/health` and `/healthz` stay unauthenticated and do not read credentials. The stdio transport does not use `CONDUIT_S2S_SECRET`.
+
+### HTTP authentication
+
+With `MCP_TRANSPORT=http` and `CONDUIT_S2S_SECRET` set, every `/mcp` request must include `X-Gateway-S2S`. The check is `verifyS2sHeader` in [`src/s2s-verify.ts`](src/s2s-verify.ts): the header value is `t=<unix seconds>,v1=<hex>`, where the hex is HMAC-SHA256 of the literal string `t=<unix seconds>` keyed with `CONDUIT_S2S_SECRET` (64 lowercase hex characters). The timestamp must be within 300 seconds of the server clock. A missing or invalid header is HTTP 401, before the UniFi API key is read.
+
+```bash
+TS=$(date +%s)
+SIG=$(printf 't=%s' "$TS" | openssl dgst -sha256 -hmac "$CONDUIT_S2S_SECRET" -hex | awk '{print $NF}')
+curl -sS http://127.0.0.1:8080/mcp \
+  -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
+  -H "X-Gateway-S2S: t=${TS},v1=${SIG}" \
+  -H "X-UniFi-Api-Key: $UNIFI_API_KEY" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+```
+
+In `AUTH_MODE=gateway`, `/mcp` also requires `X-UniFi-Api-Key`. That header is the only credential source for that request. `AUTH_MODE=env` still requires the signed `X-Gateway-S2S` header, then uses `UNIFI_API_KEY` from the environment.
 
 ## Tools
 
@@ -80,9 +104,37 @@ npm run lint   # tsc --noEmit
 
 ## Docker
 
+The image listens on `0.0.0.0` inside the container (`MCP_HTTP_HOST`) and defaults to `AUTH_MODE=gateway`. Publish the port on loopback and pass a real S2S secret. In gateway mode, the UniFi API key arrives on each request as `X-UniFi-Api-Key`; it is not read from the environment.
+
 ```bash
 docker build -t unifi-mcp .
-docker run -p 8080:8080 -e UNIFI_API_KEY=... unifi-mcp
+docker run \
+  -e CONDUIT_S2S_SECRET="$CONDUIT_S2S_SECRET" \
+  -p 127.0.0.1:8080:8080 \
+  unifi-mcp
+```
+
+Compose refuses to start when `CONDUIT_S2S_SECRET` is unset. The gateway service sets `AUTH_MODE=gateway`, does not inject `UNIFI_API_KEY`, and publishes `127.0.0.1:8080:8080`:
+
+```bash
+CONDUIT_S2S_SECRET="$CONDUIT_S2S_SECRET" docker compose up
+```
+
+Single-tenant HTTP (`AUTH_MODE=env`) still requires the S2S secret, then uses `UNIFI_API_KEY`. It is separate from the gateway Compose service above.
+
+```bash
+docker run \
+  -e CONDUIT_S2S_SECRET="$CONDUIT_S2S_SECRET" \
+  -e AUTH_MODE=env \
+  -e UNIFI_API_KEY=your-value \
+  -p 127.0.0.1:8080:8080 \
+  unifi-mcp
+```
+
+Local HTTP without a secret is development-only. It binds `127.0.0.1` and logs a warning. A non-loopback `MCP_HTTP_HOST` (including `0.0.0.0`) is overridden:
+
+```bash
+MCP_TRANSPORT=http MCP_ALLOW_INSECURE_DEV=1 npm run start:http
 ```
 
 ## License
