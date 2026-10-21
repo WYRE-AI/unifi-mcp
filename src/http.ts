@@ -159,7 +159,26 @@ export async function startHttpTransport(): Promise<Server> {
       return;
     }
 
-    // Body cap runs only after S2S passes so unauthenticated callers still get 401.
+    // Gateway mode: the API key must arrive on every request via
+    // X-UniFi-Api-Key. Reject explicitly if it is missing rather than
+    // falling through — falling through would resolve UNIFI_API_KEY from
+    // the process environment, which is not request-scoped. Checked before
+    // the body cap so credential failures are always 401, never 413.
+    let gatewayApiKey: string | undefined;
+    if (isGatewayMode) {
+      gatewayApiKey = headerValue(req.headers['x-unifi-api-key']);
+      if (!gatewayApiKey) {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            error: 'Missing credentials. Gateway must inject X-UniFi-Api-Key header.',
+          }),
+        );
+        return;
+      }
+    }
+
+    // Body cap runs only after S2S and credential checks so unauthenticated callers still get 401.
     const contentLength = Number(headerValue(req.headers['content-length']));
     if (Number.isFinite(contentLength) && contentLength > MAX_REQUEST_BODY_BYTES) {
       res.writeHead(413, { 'Content-Type': 'application/json' });
@@ -196,23 +215,8 @@ export async function startHttpTransport(): Promise<Server> {
       await transport.handleRequest(req, res);
     };
 
-    // Gateway mode: the API key must arrive on every request via
-    // X-UniFi-Api-Key. Reject explicitly if it is missing rather than
-    // falling through — falling through would resolve UNIFI_API_KEY from
-    // the process environment, which is not request-scoped.
-    if (isGatewayMode) {
-      const apiKey = headerValue(req.headers['x-unifi-api-key']);
-      if (!apiKey) {
-        res.writeHead(401, { 'Content-Type': 'application/json' });
-        res.end(
-          JSON.stringify({
-            error: 'Missing credentials. Gateway must inject X-UniFi-Api-Key header.',
-          }),
-        );
-        return;
-      }
-
-      await runWithCredentials({ apiKey }, handle);
+    if (gatewayApiKey) {
+      await runWithCredentials({ apiKey: gatewayApiKey }, handle);
       return;
     }
 
